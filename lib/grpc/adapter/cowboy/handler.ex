@@ -10,25 +10,35 @@ defmodule GRPC.Adapter.Cowboy.Handler do
 
   @adapter GRPC.Adapter.Cowboy
   @default_trailers HTTP2.server_trailers()
-  @type state :: %{pid: pid, handling_timer: reference, resp_trailers: map}
+  @type state :: %{
+          pid: pid,
+          handling_timer: reference,
+          resp_trailers: map,
+          compressor: atom | nil
+        }
 
-  @spec init(map, {GRPC.Server.servers_map(), map}) :: {:cowboy_loop, map, map}
-  def init(req, {servers, opts} = state) do
+  @spec init(map, {atom, GRPC.Server.servers_map(), map}) :: {:cowboy_loop, map, map}
+  def init(req, {endpoint, servers, opts} = state) do
     path = :cowboy_req.path(req)
-    server = Map.get(servers, GRPC.Server.service_name(path))
 
-    if server do
+    with {:ok, server} <- find_server(servers, path),
+         {:ok, codec} <- find_codec(req, server),
+         # can be nil
+         {:ok, compressor} <- find_compressor(req, server) do
       stream = %GRPC.Server.Stream{
         server: server,
+        endpoint: endpoint,
         adapter: @adapter,
         payload: %{pid: self()},
-        local: opts[:local]
+        local: opts[:local],
+        codec: codec,
+        compressor: compressor
       }
 
       pid = spawn_link(__MODULE__, :call_rpc, [server, path, stream])
       Process.flag(:trap_exit, true)
 
-      req = :cowboy_req.set_resp_headers(HTTP2.server_headers(), req)
+      req = :cowboy_req.set_resp_headers(HTTP2.server_headers(stream), req)
 
       timeout = :cowboy_req.header("grpc-timeout", req)
 
@@ -43,10 +53,67 @@ defmodule GRPC.Adapter.Cowboy.Handler do
 
       {:cowboy_loop, req, %{pid: pid, handling_timer: timer_ref}}
     else
-      error = RPCError.new(:unimplemented)
-      trailers = HTTP2.server_trailers(error.status, error.message)
-      req = send_error_trailers(req, trailers)
-      {:ok, req, state}
+      {:error, error} ->
+        trailers = HTTP2.server_trailers(error.status, error.message)
+        req = send_error_trailers(req, trailers)
+        {:ok, req, state}
+    end
+  end
+
+  defp find_server(servers, path) do
+    case Map.fetch(servers, GRPC.Server.service_name(path)) do
+      s = {:ok, _} ->
+        s
+
+      _ ->
+        {:error, RPCError.exception(status: :unimplemented)}
+    end
+  end
+
+  defp find_codec(req, server) do
+    req_content_type = :cowboy_req.header("content-type", req)
+
+    case extract_subtype(req_content_type) do
+      {:ok, subtype} ->
+        codec = Enum.find(server.__meta__(:codecs), nil, fn c -> c.name() == subtype end)
+
+        if codec do
+          {:ok, codec}
+        else
+          # TODO: Send grpc-accept-encoding header
+          {:error,
+           RPCError.exception(
+             status: :unimplemented,
+             message: "No codec registered for content-type #{req_content_type}"
+           )}
+        end
+
+      _ ->
+        {:error,
+         RPCError.exception(
+           status: :unimplemented,
+           message: "Can't recognize codec for content-type #{req_content_type}"
+         )}
+    end
+  end
+
+  defp find_compressor(req, server) do
+    encoding = :cowboy_req.header("grpc-encoding", req)
+
+    if encoding && encoding != :undefined do
+      compressor = Enum.find(server.__meta__(:compressors), nil, fn c -> c.name() == encoding end)
+
+      if compressor do
+        {:ok, compressor}
+      else
+        {:error,
+         RPCError.exception(
+           status: :unimplemented,
+           message: "Not found compressor registered for grpc-encoding #{encoding}"
+         )}
+      end
+    else
+      {:ok, nil}
     end
   end
 
@@ -59,8 +126,8 @@ defmodule GRPC.Adapter.Cowboy.Handler do
     sync_call(pid, :read_body)
   end
 
-  def stream_body(pid, data, is_fin) do
-    send(pid, {:stream_body, data, is_fin})
+  def stream_body(pid, data, opts, is_fin) do
+    send(pid, {:stream_body, data, opts, is_fin})
   end
 
   def stream_reply(pid, status, headers) do
@@ -73,6 +140,10 @@ defmodule GRPC.Adapter.Cowboy.Handler do
 
   def set_resp_trailers(pid, trailers) do
     send(pid, {:set_resp_trailers, trailers})
+  end
+
+  def set_compressor(pid, compressor) do
+    send(pid, {:set_compressor, compressor})
   end
 
   def stream_trailers(pid, trailers) do
@@ -123,10 +194,49 @@ defmodule GRPC.Adapter.Cowboy.Handler do
     {:ok, req, state}
   end
 
-  def info({:stream_body, data, is_fin}, req, state) do
-    req = check_sent_resp(req)
-    :cowboy_req.stream_body(data, is_fin, req)
-    {:ok, req, state}
+  def info({:stream_body, data, opts, is_fin}, req, state) do
+    # If compressor exists, compress is true by default
+    compressor =
+      if opts[:compress] == false do
+        nil
+      else
+        state[:compressor]
+      end
+
+    accepted_encodings =
+      case :cowboy_req.header("grpc-accept-encoding", req) do
+        :undefined ->
+          []
+
+        nil ->
+          []
+
+        s ->
+          String.split(s, ",")
+      end
+
+    if compressor && !Enum.member?(accepted_encodings, compressor.name()) do
+      %{pid: pid} = state
+
+      error =
+        RPCError.exception(
+          status: :internal,
+          message:
+            "A unaccepted encoding #{compressor.name()} is set, valid are: #{
+              :cowboy_req.header("grpc-accept-encoding", req)
+            }"
+        )
+
+      trailers = HTTP2.server_trailers(error.status, error.message)
+      exit_handler(pid, :rpc_error)
+      req = send_error_trailers(req, trailers)
+      {:stop, req, state}
+    else
+      {:ok, data, _size} = data |> GRPC.Message.to_data(compressor: compressor)
+      req = check_sent_resp(req)
+      :cowboy_req.stream_body(data, is_fin, req)
+      {:ok, req, state}
+    end
   end
 
   def info({:stream_reply, status, headers}, req, state) do
@@ -156,6 +266,17 @@ defmodule GRPC.Adapter.Cowboy.Handler do
     exit_handler(pid, :timeout)
     req = send_error_trailers(req, trailers)
     {:stop, req, state}
+  end
+
+  def info({:set_compressor, compressor}, req, state) do
+    accept_encoding = :cowboy_req.header("grpc-accept-encoding", req)
+
+    if accept_encoding && accept_encoding != :undefined do
+      req = :cowboy_req.set_resp_headers(%{"grpc-encoding" => compressor.name()}, req)
+      {:ok, req, Map.put(state, :compressor, compressor)}
+    else
+      {:ok, req, state}
+    end
   end
 
   def info({:EXIT, pid, :normal}, req, state = %{pid: pid}) do
@@ -194,21 +315,43 @@ defmodule GRPC.Adapter.Cowboy.Handler do
     :ok
   end
 
+  def terminate(_reason, _req, _state) do
+    :ok
+  end
+
   def call_rpc(server, path, stream) do
-    try do
-      do_call_rpc(server, path, stream)
-    rescue
-      e in RPCError ->
+    result =
+      try do
+        case do_call_rpc(server, path, stream) do
+          {:error, _} = err ->
+            err
+
+          _ ->
+            :ok
+        end
+      catch
+        kind, e ->
+          Logger.error(Exception.format(kind, e, System.stacktrace()))
+
+          exit({:handle_error, kind})
+      end
+
+    case result do
+      {:error, %GRPC.RPCError{} = e} ->
         exit({e, ""})
-    catch
-      kind, e ->
-        Logger.error(Exception.format(kind, e))
+
+      {:error, %{kind: kind}} ->
         exit({:handle_error, kind})
+
+      other ->
+        other
     end
   end
 
   defp do_call_rpc(server, path, stream) do
-    case server.__call_rpc__(path, stream) do
+    result = server.__call_rpc__(path, stream)
+
+    case result do
       {:ok, stream, response} ->
         stream
         |> GRPC.Server.send_reply(response)
@@ -219,11 +362,16 @@ defmodule GRPC.Adapter.Cowboy.Handler do
       {:ok, stream} ->
         GRPC.Server.send_trailers(stream, @default_trailers)
         {:ok, stream}
+
+      error ->
+        error
     end
   end
 
   defp read_full_body(req, body, timer) do
-    case :cowboy_req.read_body(req, timeout_left_opt(timer)) do
+    result = :cowboy_req.read_body(req, timeout_left_opt(timer))
+
+    case result do
       {:ok, data, req} -> {:ok, body <> data, req}
       {:more, data, req} -> read_full_body(req, body <> data, timer)
     end
@@ -267,8 +415,20 @@ defmodule GRPC.Adapter.Cowboy.Handler do
             Map.put(opts, :timeout, ms)
 
           _ ->
-            0
+            Map.put(opts, :timeout, 0)
         end
     end
+  end
+
+  defp extract_subtype("application/grpc"), do: {:ok, "proto"}
+  defp extract_subtype("application/grpc+"), do: {:ok, "proto"}
+  defp extract_subtype("application/grpc;"), do: {:ok, "proto"}
+
+  defp extract_subtype(<<"application/grpc+", rest::binary>>), do: {:ok, rest}
+  defp extract_subtype(<<"application/grpc;", rest::binary>>), do: {:ok, rest}
+
+  defp extract_subtype(type) do
+    Logger.warn("Got unknown content-type #{type}, please create an issue.")
+    {:ok, "proto"}
   end
 end

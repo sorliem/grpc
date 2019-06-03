@@ -1,13 +1,13 @@
 defmodule GRPC.Mixfile do
   use Mix.Project
 
-  @version "0.3.1"
+  @version "0.4.0-alpha.2"
 
   def project do
     [
       app: :grpc,
       version: @version,
-      elixir: "~> 1.4",
+      elixir: "~> 1.5",
       elixirc_paths: elixirc_paths(Mix.env()),
       build_embedded: Mix.env() == :prod,
       start_permanent: Mix.env() == :prod,
@@ -18,7 +18,7 @@ defmodule GRPC.Mixfile do
         extras: ["README.md"],
         main: "readme",
         source_ref: "v#{@version}",
-        source_url: "https://github.com/tony612/grpc-elixir"
+        source_url: "https://github.com/elixir-grpc/grpc"
       ]
     ]
   end
@@ -31,11 +31,18 @@ defmodule GRPC.Mixfile do
   end
 
   defp deps do
+    ex_doc_version =
+      if System.version() |> Version.compare("1.7.0") == :lt do
+        "~> 0.18.0"
+      else
+        "~> 0.19"
+      end
+
     [
       {:protobuf, "~> 0.5"},
-      {:cowboy, "~> 2.5"},
-      {:gun, "~> 1.2"},
-      {:ex_doc, "~> 0.14", only: :dev},
+      {:cowboy, github: "elixir-grpc/cowboy", tag: "grpc-2.6.3"},
+      {:gun, github: "elixir-grpc/gun", tag: "grpc-1.3.2"},
+      {:ex_doc, ex_doc_version, only: :dev},
       {:inch_ex, "~> 1.0", only: [:dev, :test]},
       {:dialyxir, "~> 0.5", only: :dev, runtime: false}
     ]
@@ -45,7 +52,7 @@ defmodule GRPC.Mixfile do
     %{
       maintainers: ["Bing Han"],
       licenses: ["Apache 2"],
-      links: %{"GitHub" => "https://github.com/tony612/grpc-elixir"},
+      links: %{"GitHub" => "https://github.com/elixir-grpc/grpc"},
       files: ~w(mix.exs README.md lib src config LICENSE .formatter.exs)
     }
   end

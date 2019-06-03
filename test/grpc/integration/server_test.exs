@@ -1,5 +1,5 @@
 defmodule GRPC.Integration.ServerTest do
-  use GRPC.Integration.TestCase, async: true
+  use GRPC.Integration.TestCase
 
   defmodule FeatureServer do
     use GRPC.Server, service: Routeguide.RouteGuide.Service
@@ -96,10 +96,10 @@ defmodule GRPC.Integration.ServerTest do
       req = Helloworld.HelloRequest.new(name: "Elixir")
       {:error, reply} = channel |> Helloworld.Greeter.Stub.say_hello(req)
 
-      assert reply == %GRPC.RPCError{
+      assert %GRPC.RPCError{
                status: GRPC.Status.unauthenticated(),
                message: "Please authenticate"
-             }
+             } == reply
     end)
   end
 

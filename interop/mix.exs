@@ -22,7 +22,10 @@ defmodule Interop.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:grpc, path: ".."}
+      {:grpc, path: "..", override: true},
+      {:grpc_prometheus, github: "tony612/elixir-grpc-prometheus"},
+      {:prometheus, "~> 4.0", override: true},
+      {:prometheus_httpd, "~> 2.0"}
     ]
   end
 end

@@ -44,21 +44,41 @@ defmodule GRPC.Stub do
   # 10 seconds
   @default_timeout 10000
 
+  @type rpc_return ::
+          {:ok, struct}
+          | {:ok, struct, map}
+          | GRPC.Client.Stream.t()
+          | {:ok, Enumerable.t()}
+          | {:ok, Enumerable.t(), map}
+          | {:error, GRPC.RPCError.t()}
+
+  require Logger
+
   defmacro __using__(opts) do
-    quote bind_quoted: [service_mod: opts[:service]] do
+    quote bind_quoted: [opts: opts] do
+      service_mod = opts[:service]
       service_name = service_mod.__meta__(:name)
 
       Enum.each(service_mod.__rpc_calls__, fn {name, {_, req_stream}, {_, res_stream}} = rpc ->
         func_name = name |> to_string |> Macro.underscore()
         path = "/#{service_name}/#{name}"
+        grpc_type = GRPC.Service.grpc_type(rpc)
+
+        stream = %GRPC.Client.Stream{
+          service_name: service_name,
+          method_name: to_string(name),
+          grpc_type: grpc_type,
+          path: path,
+          rpc: put_elem(rpc, 0, func_name),
+          server_stream: res_stream
+        }
 
         if req_stream do
           def unquote(String.to_atom(func_name))(channel, opts \\ []) do
             GRPC.Stub.call(
               unquote(service_mod),
               unquote(Macro.escape(rpc)),
-              unquote(path),
-              channel,
+              %{unquote(Macro.escape(stream)) | channel: channel},
               nil,
               opts
             )
@@ -68,8 +88,7 @@ defmodule GRPC.Stub do
             GRPC.Stub.call(
               unquote(service_mod),
               unquote(Macro.escape(rpc)),
-              unquote(path),
-              channel,
+              %{unquote(Macro.escape(stream)) | channel: channel},
               request,
               opts
             )
@@ -88,6 +107,9 @@ defmodule GRPC.Stub do
       iex> GRPC.Stub.connect("localhost:50051")
       {:ok, channel}
 
+      iex> GRPC.Stub.connect("localhost:50051", accepted_compressors: [GRPC.Compressor.Gzip])
+      {:ok, channel}
+
       iex> GRPC.Stub.connect("/paht/to/unix.sock")
       {:ok, channel}
 
@@ -96,6 +118,11 @@ defmodule GRPC.Stub do
     * `:cred` - a `GRPC.Credential` used to indicate it's a secure connection.
       An insecure connection will be created without this option.
     * `:adapter` - custom client adapter
+    * `:interceptors` - client interceptors
+    * `:codec` - client will use this to encode and decode binary message
+    * `:compressor` - the client will use this to compress requests and decompress responses. If this is set, accepted_compressors
+        will be appended also, so this can be used safely without `:accesspted_compressors`.
+    * `:accepted_compressors` - tell servers accepted compressors, this can be used without `:compressor`
   """
   @spec connect(String.t(), Keyword.t()) :: {:ok, GRPC.Channel.t()} | {:error, any}
   def connect(addr, opts \\ []) when is_binary(addr) and is_list(opts) do
@@ -124,9 +151,55 @@ defmodule GRPC.Stub do
 
     cred = Keyword.get(opts, :cred)
     scheme = if cred, do: @secure_scheme, else: @insecure_scheme
+    interceptors = Keyword.get(opts, :interceptors, []) |> init_interceptors
+    codec = Keyword.get(opts, :codec, GRPC.Codec.Proto)
+    compressor = Keyword.get(opts, :compressor)
+    accepted_compressors = Keyword.get(opts, :accepted_compressors) || []
 
-    %Channel{host: host, port: port, scheme: scheme, cred: cred, adapter: adapter}
+    accepted_compressors =
+      if compressor do
+        Enum.uniq([compressor | accepted_compressors])
+      else
+        accepted_compressors
+      end
+
+    %Channel{
+      host: host,
+      port: port,
+      scheme: scheme,
+      cred: cred,
+      adapter: adapter,
+      interceptors: interceptors,
+      codec: codec,
+      compressor: compressor,
+      accepted_compressors: accepted_compressors
+    }
     |> adapter.connect(opts[:adapter_opts])
+  end
+
+  def retry_timeout(curr) when curr < 11 do
+    timeout =
+      if curr < 11 do
+        :math.pow(1.6, curr - 1) * 1000
+      else
+        120_000
+      end
+
+    jitter =
+      if function_exported?(:rand, :uniform_real, 0) do
+        (:rand.uniform_real() - 0.5) / 2.5
+      else
+        (:rand.uniform() - 0.5) / 2.5
+      end
+
+    round(timeout + jitter * timeout)
+  end
+
+  defp init_interceptors(interceptors) do
+    Enum.map(interceptors, fn
+      {interceptor, opts} -> {interceptor, interceptor.init(opts)}
+      interceptor -> {interceptor, interceptor.init([])}
+    end)
   end
 
   @doc """
@@ -155,41 +228,68 @@ defmodule GRPC.Stub do
       with the last elem being a map of headers `%{headers: headers, trailers: trailers}`(unary) or
       `%{headers: headers}`(server streaming)
   """
-  @spec call(atom, tuple, String.t(), GRPC.Channel.t(), struct | nil, keyword) ::
-          {:ok, struct}
-          | {:ok, struct, map}
-          | GRPC.Client.Stream.t()
-          | {:ok, Enumerable.t()}
-          | {:error, GRPC.RPCError.t()}
-  def call(service_mod, rpc, path, channel, request, opts) do
-    {_, {req_mod, req_stream}, {res_mod, res_stream}} = rpc
-    marshal = fn req -> service_mod.marshal(req_mod, req) end
-    unmarshal = fn res -> service_mod.unmarshal(res_mod, res) end
+  @spec call(atom, tuple, GRPC.Client.Stream.t(), struct | nil, keyword) :: rpc_return
+  def call(_service_mod, rpc, %{channel: channel} = stream, request, opts) do
+    {_, {req_mod, req_stream}, {res_mod, _}} = rpc
 
-    stream = %GRPC.Client.Stream{
-      marshal: marshal,
-      unmarshal: unmarshal,
-      path: path,
-      req_stream: req_stream,
-      res_stream: res_stream,
-      channel: channel
-    }
+    stream = %{stream | request_mod: req_mod, response_mod: res_mod}
 
     opts = parse_req_opts(opts)
 
-    do_call(req_stream, res_stream, stream, request, opts)
+    compressor = Map.get(opts, :compressor, channel.compressor)
+    accepted_compressors = Map.get(opts, :accepted_compressors, [])
+
+    accepted_compressors =
+      if compressor do
+        Enum.uniq([compressor | accepted_compressors])
+      else
+        accepted_compressors
+      end
+
+    stream = %{
+      stream
+      | codec: Map.get(opts, :codec, channel.codec),
+        compressor: Map.get(opts, :compressor, channel.compressor),
+        accepted_compressors: accepted_compressors
+    }
+
+    do_call(req_stream, stream, request, opts)
   end
 
-  defp do_call(false, _, %{marshal: marshal, channel: channel} = stream, request, opts) do
-    message = marshal.(request)
+  defp do_call(
+         false,
+         %{channel: channel} = stream,
+         request,
+         opts
+       ) do
+    last = fn %{codec: codec, compressor: compressor} = s, _ ->
+      message = codec.encode(request)
+      opts = Map.put(opts, :compressor, compressor)
 
-    stream
-    |> channel.adapter.send_request(message, opts)
-    |> recv(opts)
+      s
+      |> channel.adapter.send_request(message, opts)
+      |> recv(opts)
+    end
+
+    next =
+      Enum.reduce(channel.interceptors, last, fn {interceptor, opts}, acc ->
+        fn s, r -> interceptor.call(s, r, acc, opts) end
+      end)
+
+    next.(stream, request)
   end
 
-  defp do_call(true, _, %{channel: channel} = stream, _, opts) do
-    channel.adapter.send_headers(stream, opts)
+  defp do_call(true, %{channel: channel} = stream, req, opts) do
+    last = fn s, _ ->
+      channel.adapter.send_headers(s, opts)
+    end
+
+    next =
+      Enum.reduce(channel.interceptors, last, fn {interceptor, opts}, acc ->
+        fn s, r -> interceptor.call(s, r, acc, opts) end
+      end)
+
+    next.(stream, req)
   end
 
   @doc """
@@ -212,10 +312,8 @@ defmodule GRPC.Stub do
       half_closed state. Default is false.
   """
   @spec send_request(GRPC.Client.Stream.t(), struct, Keyword.t()) :: GRPC.Client.Stream.t()
-  def send_request(%{marshal: marshal, channel: channel} = stream, request, opts \\ []) do
-    message = marshal.(request)
-    send_end_stream = Keyword.get(opts, :end_stream, false)
-    channel.adapter.send_data(stream, message, send_end_stream: send_end_stream)
+  def send_request(%{__interface__: interface} = stream, request, opts \\ []) do
+    interface[:send_request].(stream, request, opts)
   end
 
   @doc """
@@ -271,18 +369,30 @@ defmodule GRPC.Stub do
     * `:return_headers` - when true, headers will be returned.
   """
   @spec recv(GRPC.Client.Stream.t(), keyword | map) ::
-          {:ok, struct} | {:ok, struct, map} | Enumerable.t() | {:error, any}
+          {:ok, struct}
+          | {:ok, struct, map}
+          | {:ok, Enumerable.t()}
+          | {:ok, Enumerable.t(), map}
+          | {:error, any}
   def recv(stream, opts \\ [])
 
   def recv(%{canceled: true}, _) do
     {:error, @canceled_error}
   end
 
-  def recv(stream, opts) when is_list(opts) do
-    recv(stream, parse_recv_opts(opts))
+  def recv(%{__interface__: interface} = stream, opts) do
+    opts =
+      if is_list(opts) do
+        parse_recv_opts(opts)
+      else
+        opts
+      end
+
+    interface[:recv].(stream, opts)
   end
 
-  def recv(%{res_stream: true, channel: channel, payload: payload} = stream, opts) do
+  @doc false
+  def do_recv(%{server_stream: true, channel: channel, payload: payload} = stream, opts) do
     case recv_headers(channel.adapter, channel.adapter_payload, payload, opts) do
       {:ok, headers, is_fin} ->
         res_enum =
@@ -302,12 +412,15 @@ defmodule GRPC.Stub do
     end
   end
 
-  def recv(%{payload: payload, unmarshal: unmarshal, channel: channel}, opts) do
+  def do_recv(
+        %{payload: payload, channel: channel} = stream,
+        opts
+      ) do
     with {:ok, headers, _is_fin} <-
            recv_headers(channel.adapter, channel.adapter_payload, payload, opts),
          {:ok, body, trailers} <-
            recv_body(channel.adapter, channel.adapter_payload, payload, opts) do
-      {status, msg} = parse_response(body, trailers, unmarshal)
+      {status, msg} = parse_response(stream, headers, body, trailers)
 
       if opts[:return_headers] do
         {status, msg, %{headers: headers, trailers: trailers}}
@@ -344,15 +457,30 @@ defmodule GRPC.Stub do
     end
   end
 
-  defp parse_response(data, trailers, unmarshal) do
+  defp parse_response(
+         %{response_mod: res_mod, codec: codec, accepted_compressors: accepted_compressors},
+         headers,
+         body,
+         trailers
+       ) do
     case parse_trailers(trailers) do
       :ok ->
-        result =
-          data
-          |> GRPC.Message.from_data()
-          |> unmarshal.()
+        compressor =
+          case headers do
+            %{"grpc-encoding" => encoding} ->
+              Enum.find(accepted_compressors, nil, fn c -> c.name() == encoding end)
 
-        {:ok, result}
+            _ ->
+              nil
+          end
+
+        case GRPC.Message.from_data(%{compressor: compressor}, body) do
+          {:ok, msg} ->
+            {:ok, codec.decode(msg, res_mod)}
+
+          err ->
+            err
+        end
 
       error ->
         error
@@ -372,7 +500,8 @@ defmodule GRPC.Stub do
   defp response_stream(
          %{
            channel: %{adapter: adapter, adapter_payload: ap},
-           unmarshal: unmarshal,
+           response_mod: res_mod,
+           codec: codec,
            payload: payload
          },
          opts
@@ -385,7 +514,8 @@ defmodule GRPC.Stub do
       fin: false,
       need_more: true,
       opts: opts,
-      unmarshal: unmarshal
+      response_mod: res_mod,
+      codec: codec
     }
 
     Stream.unfold(state, fn s -> read_stream(s) end)
@@ -434,10 +564,11 @@ defmodule GRPC.Stub do
     end
   end
 
-  defp read_stream(%{buffer: buffer, need_more: false, unmarshal: unmarshal} = s) do
+  defp read_stream(%{buffer: buffer, need_more: false, response_mod: res_mod, codec: codec} = s) do
     case GRPC.Message.get_message(buffer) do
-      {message, rest} ->
-        reply = unmarshal.(message)
+      # TODO
+      {{_, message}, rest} ->
+        reply = codec.decode(message, res_mod)
         new_s = Map.put(s, :buffer, rest)
         {{:ok, reply}, new_s}
 
@@ -462,6 +593,10 @@ defmodule GRPC.Stub do
     parse_req_opts(t, Map.put(acc, :compressor, compressor))
   end
 
+  defp parse_req_opts([{:accepted_compressors, compressors} | t], acc) do
+    parse_req_opts(t, Map.put(acc, :accepted_compressors, compressors))
+  end
+
   defp parse_req_opts([{:grpc_encoding, grpc_encoding} | t], acc) do
     parse_req_opts(t, Map.put(acc, :grpc_encoding, grpc_encoding))
   end
@@ -471,7 +606,12 @@ defmodule GRPC.Stub do
   end
 
   defp parse_req_opts([{:content_type, content_type} | t], acc) do
+    Logger.warn(":content_type has been deprecated, please use :codec")
     parse_req_opts(t, Map.put(acc, :content_type, content_type))
+  end
+
+  defp parse_req_opts([{:codec, codec} | t], acc) do
+    parse_req_opts(t, Map.put(acc, :codec, codec))
   end
 
   defp parse_req_opts([{:return_headers, return_headers} | t], acc) do
